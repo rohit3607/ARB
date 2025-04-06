@@ -1,4 +1,6 @@
-pyrogram==2.0.80
+#pyrogram==2.0.80
+https://codeload.github.com/KurimuzonAkuma/pyrogram/zip/refs/heads/dev
+pyrofork==2.3.45 
 TgCrypto
 motor
 dnspython
