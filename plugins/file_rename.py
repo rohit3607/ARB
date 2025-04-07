@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Global dicts
 renaming_operations = {}
 user_tasks = {}
+user_semaphores = {}
 
 SEASON_EPISODE_PATTERNS = [
     (re.compile(r'S(\d+)(?:E|EP)(\d+)'), ('season', 'episode')),
@@ -232,13 +233,18 @@ async def auto_rename_handler(client, message):
     else:
         return await message.reply_text("Unsupported file type")
 
-    user_tasks.setdefault(user_id, [])
+    if file_id in user_tasks.get(user_id, []):
+        return await message.reply_text("This file is already being processed.")
 
-    if len(user_tasks[user_id]) >= 4:
-        return await message.reply_text("You already have 4 files being processed. Please wait...")
+    if user_id not in user_semaphores:
+        user_semaphores[user_id] = asyncio.Semaphore(4)
+    user_tasks.setdefault(user_id, []).append(file_id)
 
-    if file_id in user_tasks[user_id]:
-        return
+    async def task_wrapper():
+        try:
+            async with user_semaphores[user_id]:
+                await process_file(client, message, media_type, file_id, file_name, file_size)
+        finally:
+            user_tasks[user_id].remove(file_id)
 
-    user_tasks[user_id].append(file_id)
-    asyncio.create_task(process_file(client, message, media_type, file_id, file_name, file_size))
+    asyncio.create_task(task_wrapper())
