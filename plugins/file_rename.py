@@ -37,10 +37,16 @@ QUALITY_PATTERNS = [
 def extract_season_episode(filename):
     for pattern, (season_group, episode_group) in SEASON_EPISODE_PATTERNS:
         match = pattern.search(filename)
-        if match:
+        if not match:
+            continue
+
+        try:
             season = match.group(1) if season_group else None
-            episode = match.group(2) if episode_group else match.group(1)
+            episode = match.group(2) if episode_group and match.lastindex >= 2 else match.group(1)
             return season, episode
+        except IndexError:
+            continue
+
     return None, None
 
 def extract_quality(filename):
