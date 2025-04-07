@@ -21,7 +21,7 @@ PORT = Config.PORT
 
 class Bot(Client):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self):
         super().__init__(
             name="codeflixbots",
             api_id=Config.API_ID,
@@ -34,8 +34,8 @@ class Bot(Client):
         # Initialize the bot's start time for uptime calculation
         self.start_time = time.time()
 
-    async def start(self):
-        await super().start()
+    async def start(self, *args, **kwargs):
+        await super().start(*args, **kwargs)
         me = await self.get_me()
         self.mention = me.mention
         self.username = me.username  
