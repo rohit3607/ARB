@@ -21,7 +21,7 @@ PORT = Config.PORT
 
 class Bot(Client):
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         super().__init__(
             name="codeflixbots",
             api_id=Config.API_ID,
