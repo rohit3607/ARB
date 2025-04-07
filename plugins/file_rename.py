@@ -16,14 +16,23 @@ from helper.utils import progress_for_pyrogram, humanbytes, convert
 from helper.database import codeflixbots
 from config import Config
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
+# Global dicts
+renaming_operations = {}
 user_tasks = {}
 
 SEASON_EPISODE_PATTERNS = [
     (re.compile(r'S(\d+)(?:E|EP)(\d+)'), ('season', 'episode')),
+    (re.compile(r'S(\d+)[\s-]*(?:E|EP)(\d+)'), ('season', 'episode')),
     (re.compile(r'Season\s*(\d+)\s*Episode\s*(\d+)', re.IGNORECASE), ('season', 'episode')),
+    (re.compile(r'S(\d+)E(\d+)'), ('season', 'episode')),
+    (re.compile(r'S(\d+)[^\d]*(\d+)'), ('season', 'episode')),
     (re.compile(r'(?:E|EP|Episode)\s*(\d+)', re.IGNORECASE), (None, 'episode')),
     (re.compile(r'\b(\d+)\b'), (None, 'episode'))
 ]
@@ -32,28 +41,30 @@ QUALITY_PATTERNS = [
     (re.compile(r'\b(\d{3,4}[pi])\b', re.IGNORECASE), lambda m: m.group(1)),
     (re.compile(r'\b(4k|2160p)\b', re.IGNORECASE), lambda m: "4k"),
     (re.compile(r'\b(2k|1440p)\b', re.IGNORECASE), lambda m: "2k"),
+    (re.compile(r'\b(HDRip|HDTV)\b', re.IGNORECASE), lambda m: m.group(1)),
+    (re.compile(r'\b(4kX264|4kx265)\b', re.IGNORECASE), lambda m: m.group(1)),
+    (re.compile(r'(\d{3,4}[pi])', re.IGNORECASE), lambda m: m.group(1))
 ]
 
 def extract_season_episode(filename):
     for pattern, (season_group, episode_group) in SEASON_EPISODE_PATTERNS:
         match = pattern.search(filename)
-        if not match:
-            continue
-
-        try:
+        if match:
             season = match.group(1) if season_group else None
-            episode = match.group(2) if episode_group and match.lastindex >= 2 else match.group(1)
+            episode = match.group(2) if episode_group else match.group(1)
+            logger.info(f"Extracted season: {season}, episode: {episode} from {filename}")
             return season, episode
-        except IndexError:
-            continue
-
+    logger.warning(f"No season/episode pattern matched for {filename}")
     return None, None
 
 def extract_quality(filename):
     for pattern, extractor in QUALITY_PATTERNS:
         match = pattern.search(filename)
         if match:
-            return extractor(match)
+            quality = extractor(match)
+            logger.info(f"Extracted quality: {quality} from {filename}")
+            return quality
+    logger.warning(f"No quality pattern matched for {filename}")
     return "Unknown"
 
 async def cleanup_files(*paths):
@@ -80,7 +91,7 @@ async def process_thumbnail(thumb_path):
 async def add_metadata(input_path, output_path, user_id):
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg:
-        raise RuntimeError("FFmpeg not found")
+        raise RuntimeError("FFmpeg not found in PATH")
 
     metadata = {
         'title': await codeflixbots.get_title(user_id),
@@ -106,13 +117,17 @@ async def add_metadata(input_path, output_path, user_id):
         output_path
     ]
 
-    process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
     _, stderr = await process.communicate()
 
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
 
-async def handle_file(client, message, media_type, file_id, file_name, file_size):
+async def process_file(client, message, media_type, file_id, file_name, file_size):
     user_id = message.from_user.id
     format_template = await codeflixbots.get_format_template(user_id)
     if not format_template:
@@ -131,19 +146,19 @@ async def handle_file(client, message, media_type, file_id, file_name, file_size
         'Episode': episode or 'XX',
         'QUALITY': quality
     }
-    for k, v in replacements.items():
-        format_template = format_template.replace(k, v)
+    for placeholder, value in replacements.items():
+        format_template = format_template.replace(placeholder, value)
 
     ext = os.path.splitext(file_name)[1] or ('.mp4' if media_type == 'video' else '.mp3')
     new_filename = f"{format_template}{ext}"
-    download_path = f"downloads/{user_id}_{file_id}{ext}"
-    metadata_path = f"metadata/{user_id}_{file_id}_meta{ext}"
+    download_path = f"downloads/{new_filename}"
+    metadata_path = f"metadata/{new_filename}"
     os.makedirs(os.path.dirname(download_path), exist_ok=True)
     os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
 
     msg = await message.reply_text("**Downloading...**")
     try:
-        await client.download_media(
+        file_path = await client.download_media(
             message,
             file_name=download_path,
             progress=progress_for_pyrogram,
@@ -151,39 +166,46 @@ async def handle_file(client, message, media_type, file_id, file_name, file_size
         )
     except Exception as e:
         await msg.edit(f"Download failed: {e}")
-        user_tasks[user_id].remove(file_id)
         return
 
-    await msg.edit("**Adding metadata...**")
+    await msg.edit("**Processing metadata...**")
     try:
-        await add_metadata(download_path, metadata_path, user_id)
+        await add_metadata(file_path, metadata_path, user_id)
+        file_path = metadata_path
     except Exception as e:
-        await msg.edit(f"Metadata error: {e}")
-        user_tasks[user_id].remove(file_id)
+        await msg.edit(f"Metadata processing failed: {e}")
         return
 
-    thumb = await codeflixbots.get_thumbnail(user_id)
+    caption = await codeflixbots.get_caption(message.chat.id) or f"**{new_filename}**"
+    thumb = await codeflixbots.get_thumbnail(message.chat.id)
     thumb_path = None
+
     if thumb:
         thumb_path = await client.download_media(thumb)
     elif media_type == "video" and message.video.thumbs:
         thumb_path = await client.download_media(message.video.thumbs[0].file_id)
 
     thumb_path = await process_thumbnail(thumb_path)
-    caption = await codeflixbots.get_caption(user_id) or f"**{new_filename}**"
-
     await msg.edit("**Uploading...**")
     try:
-        upload_args = dict(chat_id=message.chat.id, caption=caption, thumb=thumb_path, progress=progress_for_pyrogram, progress_args=("Uploading...", msg, time.time()))
+        upload_params = {
+            'chat_id': message.chat.id,
+            'caption': caption,
+            'thumb': thumb_path,
+            'progress': progress_for_pyrogram,
+            'progress_args': ("Uploading...", msg, time.time())
+        }
+
         if media_type == "document":
-            await client.send_document(document=metadata_path, **upload_args)
+            await client.send_document(document=file_path, **upload_params)
         elif media_type == "video":
-            await client.send_video(video=metadata_path, **upload_args)
+            await client.send_video(video=file_path, **upload_params)
         elif media_type == "audio":
-            await client.send_audio(audio=metadata_path, **upload_args)
+            await client.send_audio(audio=file_path, **upload_params)
+
         await msg.delete()
     except Exception as e:
-        await msg.edit(f"Upload error: {e}")
+        await msg.edit(f"Upload failed: {e}")
     finally:
         await cleanup_files(download_path, metadata_path, thumb_path)
         user_tasks[user_id].remove(file_id)
@@ -213,10 +235,10 @@ async def auto_rename_handler(client, message):
     user_tasks.setdefault(user_id, [])
 
     if len(user_tasks[user_id]) >= 4:
-        return await message.reply_text("You already have 4 tasks running. Please wait...")
+        return await message.reply_text("You already have 4 files being processed. Please wait...")
 
     if file_id in user_tasks[user_id]:
         return
 
     user_tasks[user_id].append(file_id)
-    asyncio.create_task(handle_file(client, message, media_type, file_id, file_name, file_size))
+    asyncio.create_task(process_file(client, message, media_type, file_id, file_name, file_size))
