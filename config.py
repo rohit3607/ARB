@@ -5,22 +5,22 @@ id_pattern = re.compile(r'^.\d+$')
 
 class Config(object):
     # pyro client config
-    API_ID    = os.environ.get("API_ID", "28264594")
-    API_HASH  = os.environ.get("API_HASH", "94ca8a089020a2290fd29a41f18acb94")
-    BOT_TOKEN = os.environ.get("BOT_TOKEN", "7365322253:AAHRD--X_EZvJqtE58vKCWUbW8EXLXRXOno") 
+    API_ID    = os.environ.get("API_ID", "20718334")
+    API_HASH  = os.environ.get("API_HASH", "4e81464b29d79c58d0ad8a0c55ece4a5")
+    BOT_TOKEN = os.environ.get("BOT_TOKEN", "7226201611:AAFKIORqsweNvr2q0bsppyqBPzvr7MlwuTk") 
 
     # database config
-    DB_NAME = os.environ.get("DB_NAME","Yato")     
-    DB_URL  = os.environ.get("DB_URL","mongodb+srv://YatoPro:ProYato@cluster0.zeaqrcy.mongodb.net/?retryWrites=true&w=majority")
-    PORT = os.environ.get("PORT", "5481")
+    DB_NAME = os.environ.get("DB_NAME","Cluster0")     
+    DB_URL  = os.environ.get("DB_URL","mongodb+srv://spxsolo:umaid2008@cluster0.7fbux.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+    PORT = os.environ.get("PORT", "6969")
 
     # other configs
     BOT_UPTIME  = time.time()
     START_PIC   = os.environ.get("START_PIC", "https://graph.org/file/29a3acbbab9de5f45a5fe.jpg")
     ADMIN       = [int(admin) if id_pattern.search(admin) else admin for admin in os.environ.get('ADMIN', '6497757690').split()]
-    FORCE_SUB_CHANNELS = os.environ.get('FORCE_SUB_CHANNELS', 'codeflix_bots').split(',')
-    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1001868871195"))
-    DUMP_CHANNEL = int(os.environ.get("DUMP_CHANNEL", "-1001868871195"))
+    FORCE_SUB_CHANNELS = os.environ.get('FORCE_SUB_CHANNELS', 'animes_sub_society').split(',')
+    LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", "-1002078429106"))
+    DUMP_CHANNEL = int(os.environ.get("DUMP_CHANNEL", "-1002200709110"))
 
     # wes response configuration     
     WEBHOOK = bool(os.environ.get("WEBHOOK", "True"))
