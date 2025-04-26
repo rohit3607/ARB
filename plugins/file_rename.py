@@ -200,7 +200,7 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
             quality = extract_quality(file_name)
 
             # Prepare new filename
-            format_template = await get_format_template(user_id)
+            format_template = await codeflixbots.get_format_template(user_id)
             replacements = {
                 '{season}': season or 'XX',
                 '{episode}': episode or 'XX',
