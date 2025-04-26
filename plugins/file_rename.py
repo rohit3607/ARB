@@ -155,8 +155,7 @@ async def auto_rename_files(client, message):
     if not format_template:
         return await message.reply_text("Please set a rename format using /autorename")
 
-    if await check_anti_nsfw(message.file_name, message):
-        return await message.reply_text("NSFW content detected")
+    
 
     # Initialize semaphore if not exists
     if user_id not in user_semaphores:
