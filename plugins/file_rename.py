@@ -242,8 +242,8 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
                 raise
 
             # Prepare caption and thumbnail
-            caption = await get_caption(user_id) or f"**{new_filename}**"
-            thumb = await get_thumbnail(user_id)
+            caption = await codeflixbots.get_caption(user_id) or f"**{new_filename}**"
+            thumb = await codeflixbots.get_thumbnail(user_id)
             thumb_path = None
 
             if thumb:
