@@ -143,6 +143,9 @@ async def add_metadata(input_path, output_path, user_id):
         raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
 
 
+user_semaphores = {}
+renaming_operations = {}
+
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_rename_files(client: Client, message: Message):
     """Handle incoming file messages for renaming"""
@@ -156,7 +159,6 @@ async def auto_rename_files(client: Client, message: Message):
         user_semaphores[user_id] = asyncio.Semaphore(4)  # Max 4 parallel per user
 
     asyncio.create_task(process_file(client, message, user_semaphores[user_id]))
-
 
 async def process_file(client: Client, message: Message, semaphore: asyncio.Semaphore):
     """Download -> Metadata -> Upload fully parallel inside user limit"""
@@ -178,7 +180,6 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
         renaming_operations[file_unique_id] = datetime.now()
 
         try:
-            # Identify file
             media = message.document or message.video or message.audio
             media_type = (
                 "document" if message.document else
@@ -186,13 +187,12 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
                 "audio"
             )
             file_name = media.file_name or f"file_{file_unique_id}"
-            file_size = media.file_size
 
-            # Extract metadata
+            # Extract season, episode, quality
             season, episode = extract_season_episode(file_name)
             quality = extract_quality(file_name)
 
-            # Prepare new filename
+            # Format new filename
             format_template = await codeflixbots.get_format_template(user_id)
             replacements = {
                 '{season}': season or 'XX',
@@ -207,24 +207,23 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
 
             ext = os.path.splitext(file_name)[1] or ('.mp4' if media_type == 'video' else '.mp3')
             new_filename = f"{format_template}{ext}"
+
             download_path = f"downloads/{new_filename}"
             metadata_path = f"metadata/{new_filename}"
 
             os.makedirs(os.path.dirname(download_path), exist_ok=True)
             os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
 
-            # Download file
+            # Download
             status_msg = await message.reply_text("**Downloading...**")
-
-            file_path = await asyncio.to_thread(
-                client.download_media,
+            file_path = await client.download_media(
                 message,
                 file_name=download_path,
                 progress=progress_for_pyrogram,
                 progress_args=("Downloading...", status_msg, time.time())
             )
 
-            # Metadata processing
+            # Add metadata
             await status_msg.edit("**Processing metadata...**")
             try:
                 await add_metadata(file_path, metadata_path, user_id)
