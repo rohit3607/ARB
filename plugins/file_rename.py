@@ -23,35 +23,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global dictionary to track ongoing operations
+# Track renaming operations
 renaming_operations = {}
+
+# Limit concurrent downloads/uploads per user
+user_semaphores = {}
 
 # Enhanced regex patterns for season and episode extraction
 SEASON_EPISODE_PATTERNS = [
-    # Standard patterns (S01E02, S01EP02)
     (re.compile(r'S(\d+)(?:E|EP)(\d+)'), ('season', 'episode')),
-    # Patterns with spaces/dashes (S01 E02, S01-EP02)
     (re.compile(r'S(\d+)[\s-]*(?:E|EP)(\d+)'), ('season', 'episode')),
-    # Full text patterns (Season 1 Episode 2)
     (re.compile(r'Season\s*(\d+)\s*Episode\s*(\d+)', re.IGNORECASE), ('season', 'episode')),
-    # Patterns with brackets/parentheses ([S01][E02])
-    (re.compile(r'\[S(\d+)\]\[E(\d+)\]'), ('season', 'episode')),
-    # Fallback patterns (S01 13, Episode 13)
+    (re.compile(r'S(\d+)E(\d+)'), ('season', 'episode')),
     (re.compile(r'S(\d+)[^\d]*(\d+)'), ('season', 'episode')),
     (re.compile(r'(?:E|EP|Episode)\s*(\d+)', re.IGNORECASE), (None, 'episode')),
-    # Final fallback (standalone number)
     (re.compile(r'\b(\d+)\b'), (None, 'episode'))
 ]
 
 # Quality detection patterns
 QUALITY_PATTERNS = [
-    (re.compile(r'\b(\d{3,4}[pi])\b', re.IGNORECASE), lambda m: m.group(1)),  # 1080p, 720p
+    (re.compile(r'\b(\d{3,4}[pi])\b', re.IGNORECASE), lambda m: m.group(1)),
     (re.compile(r'\b(4k|2160p)\b', re.IGNORECASE), lambda m: "4k"),
     (re.compile(r'\b(2k|1440p)\b', re.IGNORECASE), lambda m: "2k"),
     (re.compile(r'\b(HDRip|HDTV)\b', re.IGNORECASE), lambda m: m.group(1)),
     (re.compile(r'\b(4kX264|4kx265)\b', re.IGNORECASE), lambda m: m.group(1)),
-    (re.compile(r'\[(\d{3,4}[pi])\]', re.IGNORECASE), lambda m: m.group(1))  # [1080p]
+    (re.compile(r'(\d{3,4}[pi])', re.IGNORECASE), lambda m: m.group(1))
 ]
+
 
 def extract_season_episode(filename):
     """Extract season and episode numbers from filename"""
@@ -65,6 +63,7 @@ def extract_season_episode(filename):
     logger.warning(f"No season/episode pattern matched for {filename}")
     return None, None
 
+
 def extract_quality(filename):
     """Extract quality information from filename"""
     for pattern, extractor in QUALITY_PATTERNS:
@@ -76,6 +75,7 @@ def extract_quality(filename):
     logger.warning(f"No quality pattern matched for {filename}")
     return "Unknown"
 
+
 async def cleanup_files(*paths):
     """Safely remove files if they exist"""
     for path in paths:
@@ -85,11 +85,12 @@ async def cleanup_files(*paths):
         except Exception as e:
             logger.error(f"Error removing {path}: {e}")
 
+
 async def process_thumbnail(thumb_path):
     """Process and resize thumbnail image"""
     if not thumb_path or not os.path.exists(thumb_path):
         return None
-    
+
     try:
         with Image.open(thumb_path) as img:
             img = img.convert("RGB").resize((320, 320))
@@ -100,12 +101,13 @@ async def process_thumbnail(thumb_path):
         await cleanup_files(thumb_path)
         return None
 
+
 async def add_metadata(input_path, output_path, user_id):
     """Add metadata to media file using ffmpeg"""
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg:
         raise RuntimeError("FFmpeg not found in PATH")
-    
+
     metadata = {
         'title': await codeflixbots.get_title(user_id),
         'artist': await codeflixbots.get_artist(user_id),
@@ -114,7 +116,7 @@ async def add_metadata(input_path, output_path, user_id):
         'audio_title': await codeflixbots.get_audio(user_id),
         'subtitle': await codeflixbots.get_subtitle(user_id)
     }
-    
+
     cmd = [
         ffmpeg,
         '-i', input_path,
@@ -129,23 +131,16 @@ async def add_metadata(input_path, output_path, user_id):
         '-loglevel', 'error',
         output_path
     ]
-    
+
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
     _, stderr = await process.communicate()
-    
+
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
-
-
-# Track renaming operations
-renaming_operations = {}
-
-# Limit concurrent downloads/uploads per user
-user_semaphores = {}
 
 
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
@@ -160,7 +155,6 @@ async def auto_rename_files(client: Client, message: Message):
     if user_id not in user_semaphores:
         user_semaphores[user_id] = asyncio.Semaphore(4)  # Max 4 parallel per user
 
-    # Immediately launch without waiting
     asyncio.create_task(process_file(client, message, user_semaphores[user_id]))
 
 
@@ -169,7 +163,6 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
     async with semaphore:
         user_id = message.from_user.id
 
-        # Unique file id to prevent duplicates
         file_unique_id = (
             message.document.file_unique_id if message.document else
             message.video.file_unique_id if message.video else
@@ -195,7 +188,7 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
             file_name = media.file_name or f"file_{file_unique_id}"
             file_size = media.file_size
 
-            # Extract metadata from filename
+            # Extract metadata
             season, episode = extract_season_episode(file_name)
             quality = extract_quality(file_name)
 
@@ -217,11 +210,10 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
             download_path = f"downloads/{new_filename}"
             metadata_path = f"metadata/{new_filename}"
 
-            # Ensure folders exist
             os.makedirs(os.path.dirname(download_path), exist_ok=True)
             os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
 
-            # Start downloading (no wait for others)
+            # Download file
             status_msg = await message.reply_text("**Downloading...**")
 
             file_path = await asyncio.to_thread(
@@ -236,7 +228,7 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
             await status_msg.edit("**Processing metadata...**")
             try:
                 await add_metadata(file_path, metadata_path, user_id)
-                file_path = metadata_path  # After metadata added
+                file_path = metadata_path
             except Exception as e:
                 await status_msg.edit(f"Metadata processing failed: {e}")
                 raise
@@ -253,7 +245,7 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
 
             thumb_path = await process_thumbnail(thumb_path)
 
-            # Uploading
+            # Upload
             await status_msg.edit("**Uploading...**")
             upload_params = {
                 'chat_id': message.chat.id,
@@ -276,6 +268,5 @@ async def process_file(client: Client, message: Message, semaphore: asyncio.Sema
             await message.reply_text(f"Error: {str(e)}")
 
         finally:
-            # Clean temp files
             await cleanup_files(download_path, metadata_path, thumb_path)
             renaming_operations.pop(file_unique_id, None)
