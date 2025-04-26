@@ -164,14 +164,25 @@ async def auto_rename_files(client, message):
     # Launch task
     asyncio.create_task(process_file(client, message, user_semaphores[user_id]))
 
-
 async def process_file(client, message, semaphore):
     """Process single file inside semaphore"""
     async with semaphore:
         user_id = message.from_user.id
 
+        # Prevent duplicate processing based on file_id
+        file_id = None
+        if message.document:
+            file_id = message.document.file_id
+        elif message.video:
+            file_id = message.video.file_id
+        elif message.audio:
+            file_id = message.audio.file_id
+
+        # If file_id is None, return early as no file was attached
+        if not file_id:
+            return await message.reply_text("This message does not contain a valid media file")
+
         # Prevent duplicate processing
-        file_id = message.file_id
         if file_id in renaming_operations:
             if (datetime.now() - renaming_operations[file_id]).seconds < 10:
                 return
@@ -198,7 +209,7 @@ async def process_file(client, message, semaphore):
             season, episode = extract_season_episode(file_name)
             quality = extract_quality(file_name)
 
-            # Replace template
+            # Replace template placeholders
             replacements = {
                 '{season}': season or 'XX',
                 '{episode}': episode or 'XX',
@@ -208,10 +219,11 @@ async def process_file(client, message, semaphore):
                 'QUALITY': quality
             }
 
+            format_template = await codeflixbots.get_format_template(user_id)  # Ensure we get the correct template
             for placeholder, value in replacements.items():
-                format_template = await codeflixbots.get_format_template(user_id)
                 format_template = format_template.replace(placeholder, value)
 
+            # Set file extensions based on media type
             ext = os.path.splitext(file_name)[1] or ('.mp4' if media_type == 'video' else '.mp3')
             new_filename = f"{format_template}{ext}"
             download_path = f"downloads/{new_filename}"
@@ -220,6 +232,7 @@ async def process_file(client, message, semaphore):
             os.makedirs(os.path.dirname(download_path), exist_ok=True)
             os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
 
+            # Download the file
             msg = await message.reply_text("**Downloading...**")
             try:
                 file_path = await client.download_media(
@@ -234,12 +247,14 @@ async def process_file(client, message, semaphore):
 
             await msg.edit("**Processing metadata...**")
             try:
+                # Process metadata and apply to the file
                 await add_metadata(file_path, metadata_path, user_id)
                 file_path = metadata_path
             except Exception as e:
                 await msg.edit(f"Metadata processing failed: {e}")
                 raise
 
+            # Prepare for upload
             caption = await codeflixbots.get_caption(message.chat.id) or f"**{new_filename}**"
             thumb = await codeflixbots.get_thumbnail(message.chat.id)
             thumb_path = None
@@ -261,6 +276,7 @@ async def process_file(client, message, semaphore):
                     'progress_args': ("Uploading...", msg, time.time())
                 }
 
+                # Upload based on media type
                 if media_type == "document":
                     await client.send_document(document=file_path, **upload_params)
                 elif media_type == "video":
@@ -277,6 +293,6 @@ async def process_file(client, message, semaphore):
             await message.reply_text(f"Error: {str(e)}")
 
         finally:
-            # Cleanup
+            # Cleanup files after operation
             await cleanup_files(download_path, metadata_path, thumb_path)
             renaming_operations.pop(file_id, None)
