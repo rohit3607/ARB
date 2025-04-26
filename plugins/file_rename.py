@@ -152,7 +152,7 @@ user_semaphores = {}
 async def auto_rename_files(client: Client, message: Message):
     """Handle incoming file messages for renaming"""
     user_id = message.from_user.id
-    format_template = await get_format_template(user_id)
+    format_template = await codeflixbots.get_format_template(user_id)
 
     if not format_template:
         return await message.reply_text("Please set a rename format using /autorename.")
