@@ -141,28 +141,23 @@ async def add_metadata(input_path, output_path, user_id):
         raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
 
 
-# Semaphore to limit concurrent downloads
 user_download_semaphores = {}
-
-# Track active downloads/uploads to prevent duplicates
 renaming_operations = {}
 
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_rename_files(client, message):
     user_id = message.from_user.id
 
-    # Initialize semaphore for each user
     if user_id not in user_download_semaphores:
         user_download_semaphores[user_id] = asyncio.Semaphore(4)
 
-    # Launch download as separate task (non-blocking)
-    asyncio.create_task(handle_download(client, message, user_download_semaphores[user_id]))
+    # No waiting — launch immediately
+    asyncio.create_task(schedule_download(client, message, user_download_semaphores[user_id]))
 
 
-async def handle_download(client, message, semaphore):
+async def schedule_download(client, message, semaphore):
     user_id = message.from_user.id
 
-    # Get file_id properly
     file_id = None
     if message.document:
         file_id = message.document.file_id
@@ -180,7 +175,6 @@ async def handle_download(client, message, semaphore):
             return
     renaming_operations[file_id] = datetime.now()
 
-    # Get original filename
     if message.document:
         file_name = message.document.file_name
         media_type = "document"
@@ -193,7 +187,7 @@ async def handle_download(client, message, semaphore):
     else:
         return await message.reply_text("Unsupported file type")
 
-    msg = await message.reply_text("**Downloading...**")
+    msg = await message.reply_text("**Queued for download...**")
 
     ext = os.path.splitext(file_name)[1] or ('.mp4' if media_type == 'video' else '.mp3')
     safe_file_name = f"{file_id}{ext}"
@@ -201,9 +195,15 @@ async def handle_download(client, message, semaphore):
 
     os.makedirs(os.path.dirname(download_path), exist_ok=True)
 
+    # Don't block here — launch download task immediately
+    asyncio.create_task(do_download(client, message, semaphore, file_id, download_path, file_name, media_type, msg))
+
+
+async def do_download(client, message, semaphore, file_id, download_path, file_name, media_type, msg):
     try:
-        # Only download limited to semaphore (max 4)
+        # Respect semaphore
         async with semaphore:
+            await msg.edit("**Downloading...**")
             file_path = await client.download_media(
                 message,
                 file_name=download_path,
@@ -213,7 +213,7 @@ async def handle_download(client, message, semaphore):
 
         await msg.edit("**Downloaded! Starting processing...**")
 
-        # Immediately process metadata + upload in a new task (no semaphore)
+        # Now start metadata/upload (no semaphore needed)
         asyncio.create_task(process_and_upload(client, message, file_path, file_name, media_type, msg))
 
     except Exception as e:
@@ -228,12 +228,10 @@ async def process_and_upload(client, message, file_path, original_name, media_ty
         season, episode = extract_season_episode(original_name)
         quality = extract_quality(original_name)
 
-        # Fetch format template
         format_template = await codeflixbots.get_format_template(user_id)
         if not format_template:
             format_template = "{quality} Episode {episode}"
 
-        # Replace placeholders
         replacements = {
             '{season}': season or 'XX',
             '{episode}': episode or 'XX',
@@ -257,7 +255,7 @@ async def process_and_upload(client, message, file_path, original_name, media_ty
             await add_metadata(file_path, metadata_path, user_id)
             final_path = metadata_path
         except Exception:
-            final_path = file_path  # fallback if metadata fails
+            final_path = file_path
 
         caption = await codeflixbots.get_caption(user_id) or f"**{new_filename}**"
         thumb = await codeflixbots.get_thumbnail(user_id)
