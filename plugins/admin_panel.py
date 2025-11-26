@@ -3,7 +3,7 @@ from helper.database import codeflixbots
 from pyrogram.types import Message
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
-import os, sys, time, asyncio, logging, datetime
+import os, sys, time, asyncio, logging, datetime, subprocess, re
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
@@ -12,6 +12,32 @@ ADMIN_USER_ID = Config.ADMIN
 
 # Flag to indicate if the bot is restarting
 is_restarting = False
+
+@Client.on_message(filters.command('update') & filters.private & filters.user(ADMIN_USER_ID))
+async def update_bot(client, message):
+    msg = await message.reply_text("🔄 Pulling updates from GitHub...")
+    try:
+        pull = subprocess.run(["git", "pull"], capture_output=True, text=True)
+        if pull.returncode == 0:
+            await msg.edit(f"✅ Updated:\n<pre>{pull.stdout}</pre>")
+        else:
+            await msg.edit(f"❌ Git error:\n<pre>{pull.stderr}</pre>")
+            return
+
+        await asyncio.sleep(2)
+        await msg.edit("♻️ Rᴇsᴛᴀʀᴛɪɴɢ ʙᴏᴛ...")
+
+        # ✅ Delete after 5s
+        await asyncio.sleep(5)
+        try:
+            await msg.delete()
+        except:
+            pass
+
+        os.execl(sys.executable, sys.executable, *sys.argv)
+
+    except Exception as e:
+        await msg.edit(f"⚠️ Error: {e}")
 
 @Client.on_message(filters.private & filters.command("restart") & filters.user(ADMIN_USER_ID))
 async def restart_bot(b, m):
