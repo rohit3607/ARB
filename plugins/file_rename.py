@@ -31,48 +31,171 @@ user_semaphores = {}
 
 # Enhanced regex patterns for season and episode extraction
 SEASON_EPISODE_PATTERNS = [
-    (re.compile(r'S(\d+)(?:E|EP)(\d+)'), ('season', 'episode')),
-    (re.compile(r'S(\d+)[\s-]*(?:E|EP)(\d+)'), ('season', 'episode')),
-    (re.compile(r'Season\s*(\d+)\s*Episode\s*(\d+)', re.IGNORECASE), ('season', 'episode')),
-    (re.compile(r'S(\d+)E(\d+)'), ('season', 'episode')),
-    (re.compile(r'S(\d+)[^\d]*(\d+)'), ('season', 'episode')),
-    (re.compile(r'(?:E|EP|Episode)\s*(\d+)', re.IGNORECASE), (None, 'episode')),
-    (re.compile(r'\b(\d+)\b'), (None, 'episode'))
+    # Priority 1: Most specific and unambiguous patterns first
+    
+    # Standard SxxExx formats (highest confidence)
+    (re.compile(r'\bS(\d{1,2})[\.\-_]?E(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # S01E04, S1-E4, S01.E04
+    (re.compile(r'\bS(\d{1,2})\s+E(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # S01 E04
+    (re.compile(r'\[S(\d{1,2})[\.\-_]?E(\d{1,3})\]', re.IGNORECASE), (1, 2)),  # [S01E04]
+    (re.compile(r'\(S(\d{1,2})[\.\-_]?E(\d{1,3})\)', re.IGNORECASE), (1, 2)),  # (S01E04)
+    
+    # xxExx formats
+    (re.compile(r'\b(\d{1,2})x(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # 1x04, 01x123
+    (re.compile(r'\[(\d{1,2})x(\d{1,3})\]', re.IGNORECASE), (1, 2)),  # [1x04]
+    (re.compile(r'\((\d{1,2})x(\d{1,3})\)', re.IGNORECASE), (1, 2)),  # (1x04)
+    
+    # Season/Episode explicit formats
+    (re.compile(r'\bSeason[\s\-_.]*(\d{1,2})[\s\-_.]*Episode[\s\-_.]*(\d{1,3})\b', re.IGNORECASE), (1, 2)),
+    (re.compile(r'\bSeason[\s\-_.]*(\d{1,2})[\s\-_.]*Ep[\s\-_.]*(\d{1,3})\b', re.IGNORECASE), (1, 2)),
+    (re.compile(r'\bSeason[\s\-_.]*(\d{1,2})[\s\-_.]*E[\s\-_.]*(\d{1,3})\b', re.IGNORECASE), (1, 2)),
+    
+    # Separated bracket formats
+    (re.compile(r'\[S(\d{1,2})\][\s\-_.]*\[E(\d{1,3})\]', re.IGNORECASE), (1, 2)),  # [S01][E04]
+    (re.compile(r'\(S(\d{1,2})\)[\s\-_.]*\(E(\d{1,3})\)', re.IGNORECASE), (1, 2)),  # (S01)(E04)
+    
+    # Dot and dash separated formats
+    (re.compile(r'\bS(\d{1,2})\.(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # S01.04
+    (re.compile(r'\bS(\d{1,2})\-(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # S01-04
+    (re.compile(r'\b(\d{1,2})\.(\d{1,3})\b(?!p|fps)', re.IGNORECASE), (1, 2)),  # 1.04 (exclude quality)
+    (re.compile(r'\b(\d{1,2})\-(\d{1,3})\b(?!p|fps)', re.IGNORECASE), (1, 2)),  # 1-04 (exclude quality)
+    
+    # Priority 2: Less specific but still reliable patterns
+    
+    # Space separated formats
+    (re.compile(r'\bS\s*(\d{1,2})\s+(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # S 01 04
+    (re.compile(r'\bSeason\s*(\d{1,2})\s+(\d{1,3})\b', re.IGNORECASE), (1, 2)),  # Season 1 04
+    
+    # Episode-first formats
+    (re.compile(r'\bE(\d{1,3})[\s\-_.]*S(\d{1,2})\b', re.IGNORECASE), (2, 1)),  # E04 S01
+    (re.compile(r'\bEp[\s\-_.]*(\d{1,3})[\s\-_.]*S(\d{1,2})\b', re.IGNORECASE), (2, 1)),  # Ep 04 S01
+    
+    # Priority 3: Episode-only patterns (with better context)
+    (re.compile(r'(?:^|[\s\-_.(\[])E(\d{2,4})(?=[\s\-_.)\]]|$)(?!p|fps)', re.IGNORECASE), (None, 1)),  # E04, [E04], (E04)
+    (re.compile(r'(?:^|[\s\-_.(\[])Episode[\s\-_.]*(\d{1,3})(?=[\s\-_.)\]]|$)', re.IGNORECASE), (None, 1)),  # Episode 04
+    (re.compile(r'(?:^|[\s\-_.(\[])Ep[\s\-_.]*(\d{1,3})(?=[\s\-_.)\]]|$)', re.IGNORECASE), (None, 1)),  # Ep 04
+    
+    # Group tag followed by episode
+    (re.compile(r'\[[A-Za-z0-9\-]+\][\s\-_.]+E(\d{1,3})(?![\dp])', re.IGNORECASE), (None, 1)),  # [Group] Title E04
+    (re.compile(r'\[[A-Za-z0-9\-]+\][\s\-_.]+Episode[\s\-_.]*(\d{1,3})(?![\dp])', re.IGNORECASE), (None, 1)),  # [Group] Title Episode 04
+    
+    # Priority 4: Generic patterns (lower confidence)
+    (re.compile(r'(?:^|[\s\-_.])(\d{2,3})(?=[\s\-_.]|$)(?!p|fps|\d)', re.IGNORECASE), (None, 1)),  # 04, -04.
+    (re.compile(r'\[(\d{2,3})\](?!p|fps)', re.IGNORECASE), (None, 1)),  # [04]
+    
+    # Season-only patterns (lowest priority)
+    (re.compile(r'\bS(\d{1,2})\b(?![\dE])', re.IGNORECASE), (1, None)),  # S01 (not followed by E or digit)
+    (re.compile(r'\bSeason[\s\-_.]*(\d{1,2})\b', re.IGNORECASE), (1, None)),  # Season 1
+#---
+
+    # Very specific patterns with strict boundaries
+    (re.compile(r'^S(\d{2})E(\d{2})$', re.IGNORECASE), (1, 2)),  # S01E04
+    (re.compile(r'^(\d{1,2})x(\d{2})$', re.IGNORECASE), (1, 2)),  # 1x04
+    (re.compile(r'^Season\s*(\d{1,2})\s*Episode\s*(\d{1,2})$', re.IGNORECASE), (1, 2)),
+    (re.compile(r'^S(\d{2})\s*-\s*E(\d{2})$', re.IGNORECASE), (1, 2)),  # S01 - E04
+    
+    # Bracket-enclosed exact patterns
+    (re.compile(r'^\[S(\d{2})E(\d{2})\]$', re.IGNORECASE), (1, 2)),
+    (re.compile(r'^\[(\d{1,2})x(\d{2})\]$', re.IGNORECASE), (1, 2)),
+    (re.compile(r'^\(S(\d{2})E(\d{2})\)$', re.IGNORECASE), (1, 2)),
+    
+    # Dot-separated exact patterns
+    (re.compile(r'^S(\d{2})\.E(\d{2})$', re.IGNORECASE), (1, 2)),  # S01.E04
+    (re.compile(r'^(\d{1,2})\.(\d{2})$', re.IGNORECASE), (1, 2)),  # 1.04
+    
+    # Episode-only exact patterns
+    (re.compile(r'^E(\d{2,3})$', re.IGNORECASE), (None, 1)),  # E04, E104
+    (re.compile(r'^Episode\s*(\d{1,3})$', re.IGNORECASE), (None, 1)),
+    (re.compile(r'^\[E(\d{2,3})\]$', re.IGNORECASE), (None, 1)),
 ]
+
+
 
 # Quality detection patterns
 QUALITY_PATTERNS = [
-    (re.compile(r'\b(\d{3,4}[pi])\b', re.IGNORECASE), lambda m: m.group(1)),
-    (re.compile(r'\b(4k|2160p)\b', re.IGNORECASE), lambda m: "4k"),
-    (re.compile(r'\b(2k|1440p)\b', re.IGNORECASE), lambda m: "2k"),
-    (re.compile(r'\b(HDRip|HDTV)\b', re.IGNORECASE), lambda m: m.group(1)),
-    (re.compile(r'\b(4kX264|4kx265)\b', re.IGNORECASE), lambda m: m.group(1)),
-    (re.compile(r'(\d{3,4}[pi])', re.IGNORECASE), lambda m: m.group(1))
+    (re.compile(r'(?<!\d)(144p)(?!\d)', re.IGNORECASE), lambda m: "144p"),
+    (re.compile(r'(?<!\d)(240p)(?!\d)', re.IGNORECASE), lambda m: "240p"),
+    (re.compile(r'(?<!\d)(360p)(?!\d)', re.IGNORECASE), lambda m: "360p"),
+    (re.compile(r'(?<!\d)(480p)(?!\d)', re.IGNORECASE), lambda m: "480p"),
+    (re.compile(r'\bSD\b', re.IGNORECASE), lambda m: "480p"),
+    (re.compile(r'(?<!\d)(540p)(?!\d)', re.IGNORECASE), lambda m: "540p"),
+    (re.compile(r'(?<!\d)(720p)(?!\d)', re.IGNORECASE), lambda m: "720p"),
+    (re.compile(r'\bHD\b', re.IGNORECASE), lambda m: "720p"),
+    (re.compile(r'(?<!\d)(1080p)(?!\d)', re.IGNORECASE), lambda m: "1080p"),
+    (re.compile(r'\bFHD\b', re.IGNORECASE), lambda m: "1080p"),
+    (re.compile(r'(?<!\d)(1440p)(?!\d)', re.IGNORECASE), lambda m: "1440p"),
+    (re.compile(r'(?<!\d)(2160p)(?!\d)', re.IGNORECASE), lambda m: "2160p"),
+    (re.compile(r'\b4k\b', re.IGNORECASE), lambda m: "2160p"),
+    (re.compile(r'[_\-. ](144p|240p|360p|480p|540p|720p|1080p|1440p|2160p)(?=[_\-. ])', re.IGNORECASE), lambda m: m.group(1)),
+    (re.compile(r'\bHDRip\b', re.IGNORECASE), lambda m: "HDRip"),
 ]
 
 
 def extract_season_episode(filename):
-    """Extract season and episode numbers from filename"""
-    for pattern, (season_group, episode_group) in SEASON_EPISODE_PATTERNS:
+    import re
+    filename = re.sub(r'\(.*?\)', ' ', filename)
+
+    for pattern, group_info in SEASON_EPISODE_PATTERNS:
         match = pattern.search(filename)
         if match:
-            season = match.group(1) if season_group else None
-            episode = match.group(2) if episode_group else match.group(1)
-            logger.info(f"Extracted season: {season}, episode: {episode} from {filename}")
-            return season, episode
-    logger.warning(f"No season/episode pattern matched for {filename}")
-    return None, None
+            season = episode = None
+            if isinstance(group_info, tuple):
+                try:
+                    if group_info[0] is not None:
+                        group_num = int(group_info[0])
+                        if match.lastindex and group_num <= match.lastindex:
+                            season = match.group(group_num).zfill(2) if match.group(group_num) else "01"
+                        else:
+                            continue
+                    else:
+                        season = "01"
+                    
+                    if group_info[1] is not None:
+                        group_num = int(group_info[1])
+                        if match.lastindex and group_num <= match.lastindex:
+                            episode = match.group(group_num).zfill(2) if match.group(group_num) else None
+                        else:
+                            continue
+                except (ValueError, IndexError, AttributeError):
+                    continue
 
+                if episode:
+                    return season, episode
+
+    return "01", None  # Default values if no match found
+
+def extract_part(filename):
+    filename = re.sub(r'\(.*?\)', ' ', filename)  # Clean parentheses content
+
+    for pattern, (part_group,) in PART_PATTERNS:
+        match = pattern.search(filename)
+        if match:
+            part = match.group(1).zfill(2)
+            logger.info(f"Extracted part: {part} from {filename}")
+            return part
+
+    logger.warning(f"No part pattern matched for {filename}")
+    return None
 
 def extract_quality(filename):
-    """Extract quality information from filename"""
+    seen = set()
+    quality_parts = []
+
     for pattern, extractor in QUALITY_PATTERNS:
         match = pattern.search(filename)
         if match:
-            quality = extractor(match)
-            logger.info(f"Extracted quality: {quality} from {filename}")
-            return quality
-    logger.warning(f"No quality pattern matched for {filename}")
+            quality = extractor(match).lower()
+            if quality not in seen:
+                quality_parts.append(quality)
+                seen.add(quality)
+                filename = filename.replace(match.group(0), '', 1)
+
+    resolution_qualities = [q for q in quality_parts if q.endswith("p") or q == "4k" or q == "2160p"]
+    
+    if resolution_qualities:
+        return resolution_qualities[0] 
+    elif "HDrip" in quality_parts:
+        return "HDRip"
+    
     return "Unknown"
 
 
@@ -99,6 +222,47 @@ async def process_thumbnail(thumb_path):
     except Exception as e:
         logger.error(f"Thumbnail processing failed: {e}")
         await cleanup_files(thumb_path)
+        return None
+
+async def process_thumbnail_pdf(thumb_path, video_path=None):
+    if not thumb_path or not os.path.exists(thumb_path):
+        print("PDF thumbnail not found.")
+        # Try generating from video
+        if video_path and os.path.exists(video_path):
+            output_path = os.path.join("downloads", f"{Path(video_path).stem}_pdf_thumb.jpg")
+            thumb_path = await asyncio.to_thread(generate_thumbnail, video_path, output_path)
+            if thumb_path:
+                print("Generated thumbnail from video for PDF.")
+            else:
+                print("Failed to generate PDF thumbnail from video.")
+                return None
+        else:
+            print("No valid video path provided for PDF thumbnail generation.")
+            return None
+    else:
+        print("Using user-provided thumbnail for PDF.")
+
+    try:
+        # Open and convert to RGB
+        img = await asyncio.to_thread(Image.open, thumb_path)
+        img = await asyncio.to_thread(lambda: img.convert("RGB"))
+
+        # Resize to fit within 320x320 (maintains aspect ratio)
+        img = await asyncio.to_thread(lambda: ImageOps.contain(img, (320, 320), Image.LANCZOS))
+
+        # Pad to exactly 320x320 (black background)
+        img = await asyncio.to_thread(lambda: ImageOps.pad(img, (320, 320), color=(0, 0, 0)))
+
+        # Save with high quality
+        await asyncio.to_thread(img.save, thumb_path, "JPEG", quality=95)
+
+        print(f"PDF Thumbnail processed successfully: {thumb_path}")
+        return thumb_path
+
+    except Exception as e:
+        print(f"PDF Thumbnail processing failed: {e}")
+        if os.path.exists(thumb_path):
+            os.remove(thumb_path)
         return None
 
 
