@@ -12,10 +12,6 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
-from hachoir.metadata import extractMetadata
-from hachoir.parser import createParser
-
-from plugins.antinsfw import check_anti_nsfw
 from helper.utils import progress_for_pyrogram, humanbytes, convert
 from helper.database import codeflixbots
 from config import Config
@@ -27,11 +23,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Track renaming operations
+# Track renaming operations (avoid duplicates)
 renaming_operations: dict[str, datetime] = {}
 
-# Limit concurrent operations per user (1 = sequential queue)
-user_semaphores: dict[int, asyncio.Semaphore] = {}
+# Per-user job queue: user_id -> list[(sort_key, Message)]
+user_jobs: dict[int, list[tuple[float, Message]]] = {}
+
+# Per-user worker task
+user_workers: dict[int, asyncio.Task] = {}
 
 # -------------------- REGEX PATTERNS --------------------
 
@@ -44,8 +43,8 @@ SEASON_EPISODE_PATTERNS = [
 
     # xxExx formats
     (re.compile(r'\b(\d{1,2})x(\d{1,3})\b', re.IGNORECASE), (1, 2)),            # 1x04, 01x123
-    (re.compile(r'\[(\d{1,2})x(\d{1,3})\]', re.IGNORECASE), (1, 2)),           # [1x04]
-    (re.compile(r'\((\d{1,2})x(\d{1,3})\)', re.IGNORECASE), (1, 2)),           # (1x04)
+    (re.compile(r'\[(\d{1,2})x(\d{1,3})\]', re.IGNORECASE), (1, 2)),            # [1x04]
+    (re.compile(r'\((\d{1,2})x(\d{1,3})\)', re.IGNORECASE), (1, 2)),            # (1x04)
 
     # Season/Episode explicit formats
     (re.compile(r'\bSeason[\s\-_.]*(\d{1,2})[\s\-_.]*Episode[\s\-_.]*(\d{1,3})\b', re.IGNORECASE), (1, 2)),
@@ -108,7 +107,6 @@ SEASON_EPISODE_PATTERNS = [
     (re.compile(r'^\[E(\d{2,3})\]$', re.IGNORECASE), (None, 1)),
 ]
 
-
 QUALITY_PATTERNS = [
     (re.compile(r'(?<!\d)(144p)(?!\d)', re.IGNORECASE), lambda m: "144p"),
     (re.compile(r'(?<!\d)(240p)(?!\d)', re.IGNORECASE), lambda m: "240p"),
@@ -131,30 +129,53 @@ QUALITY_PATTERNS = [
 
 
 def extract_season_episode(filename: str):
-    # Remove things inside parentheses
+    """
+    Extract season and episode from filename.
+
+    Special handling for manga-style chapters:
+    [ Ch 31 ], [ Ch 31.5 ], Ch 36.6, etc.
+    """
+    # Remove text inside parentheses to reduce noise
     filename = re.sub(r'\(.*?\)', ' ', filename)
 
+    # 1) Decimal chapter / episode patterns first (for things like "Ch 31.5", "[ Ch 36.6 ]")
+    decimal_patterns = [
+        re.compile(r'\[(?:\s*Ch(?:apter)?\s+(\d{1,3}(?:\.\d{1,2})?)\s*)\]', re.IGNORECASE),  # [ Ch 31.5 ]
+        re.compile(r'\bCh(?:apter)?\s*(\d{1,3}(?:\.\d{1,2})?)\b', re.IGNORECASE),            # Ch 31.5
+        re.compile(r'\b(\d{1,3}\.\d{1,2})\b', re.IGNORECASE),                                # 31.5 (plain)
+    ]
+
+    for pattern in decimal_patterns:
+        m = pattern.search(filename)
+        if m:
+            episode = m.group(1)  # keep as string, don't zfill; preserves 31.5
+            season = "01"
+            return season, episode
+
+    # 2) Fallback to standard SxxExx patterns etc.
     for pattern, group_info in SEASON_EPISODE_PATTERNS:
         match = pattern.search(filename)
         if match:
-            season = episode = None
+            season = None
+            episode = None
             if isinstance(group_info, tuple):
                 try:
                     # Season
                     if group_info[0] is not None:
                         g = int(group_info[0])
                         if match.lastindex and g <= match.lastindex:
+                            # keep 2-digit season for neatness
                             season = match.group(g).zfill(2) if match.group(g) else "01"
                         else:
                             continue
                     else:
                         season = "01"
 
-                    # Episode
+                    # Episode (keep as-is without zfill for template)
                     if group_info[1] is not None:
                         g = int(group_info[1])
                         if match.lastindex and g <= match.lastindex:
-                            episode = match.group(g).zfill(2) if match.group(g) else None
+                            episode = match.group(g) if match.group(g) else None
                         else:
                             continue
                 except (ValueError, IndexError, AttributeError):
@@ -163,7 +184,7 @@ def extract_season_episode(filename: str):
                 if episode:
                     return season, episode
 
-    # Default: Season 01, episode unknown
+    # Default if nothing matched
     return "01", None
 
 
@@ -188,6 +209,20 @@ def extract_quality(filename: str) -> str:
         return "HDRip"
 
     return "Unknown"
+
+
+def get_episode_sort_key(filename: str) -> float:
+    """
+    Convert extracted episode (e.g. '31', '31.5', '36.6') into a float for sorting.
+    If not found or invalid, return +inf to push it to the end.
+    """
+    _, episode = extract_season_episode(filename)
+    if not episode:
+        return float('inf')
+    try:
+        return float(episode)
+    except ValueError:
+        return float('inf')
 
 
 async def cleanup_files(*paths: str):
@@ -266,12 +301,42 @@ async def process_pdf_thumbnail(thumb_path: str) -> str | None:
         return None
 
 
+# -------------------- WORKER LOGIC (SORTED BY EPISODE) --------------------
+
+
+async def user_worker(client: Client, user_id: int):
+    """
+    Per-user worker that takes jobs from user_jobs[user_id],
+    sorts them by episode number, and processes them in that order.
+    """
+    # Small delay to allow "burst" of messages to queue up
+    await asyncio.sleep(2)
+
+    try:
+        while True:
+            jobs = user_jobs.get(user_id, [])
+            if not jobs:
+                break
+
+            # Sort by numeric chapter (episode)
+            jobs.sort(key=lambda item: item[0])  # item = (sort_key, Message)
+            sort_key, msg = jobs.pop(0)
+
+            # Process that PDF
+            await process_single_pdf(client, msg)
+
+    finally:
+        # Cleanup when done
+        user_workers.pop(user_id, None)
+        user_jobs.pop(user_id, None)
+
+
 # -------------------- MAIN HANDLER (PDF ONLY) --------------------
 
 
 @Client.on_message(filters.private & filters.document)
 async def auto_rename_pdfs(client: Client, message: Message):
-    """Handle incoming PDF documents for auto rename."""
+    """Handle incoming PDF documents for auto rename, and queue them by chapter."""
     user_id = message.from_user.id
     document = message.document
 
@@ -289,107 +354,117 @@ async def auto_rename_pdfs(client: Client, message: Message):
     if not format_template:
         return await message.reply_text("Please set a rename format using /autorename before sending PDFs.")
 
-    # Per-user semaphore (1 = sequential queue)
-    if user_id not in user_semaphores:
-        user_semaphores[user_id] = asyncio.Semaphore(1)
+    # Compute sort key based on episode/chapter (e.g. 31, 31.5, 36.6)
+    sort_key = get_episode_sort_key(filename)
 
-    asyncio.create_task(process_pdf_file(client, message, user_semaphores[user_id]))
+    # Add job to user's queue
+    jobs = user_jobs.setdefault(user_id, [])
+    jobs.append((sort_key, message))
+
+    # Start worker if not already running
+    if user_id not in user_workers or user_workers[user_id].done():
+        user_workers[user_id] = asyncio.create_task(user_worker(client, user_id))
 
 
-async def process_pdf_file(client: Client, message: Message, semaphore: asyncio.Semaphore):
-    """Download -> Rename -> Generate PDF thumb -> Upload (sequential per user)."""
-    async with semaphore:
-        user_id = message.from_user.id
-        document = message.document
+# -------------------- SINGLE PDF PROCESSOR --------------------
 
-        file_unique_id = document.file_unique_id if document else None
-        if not file_unique_id:
-            return await message.reply_text("Unsupported file type.")
 
-        # Prevent accidental double-processing
-        if file_unique_id in renaming_operations:
-            if (datetime.now() - renaming_operations[file_unique_id]).seconds < 10:
-                return
-        renaming_operations[file_unique_id] = datetime.now()
+async def process_single_pdf(client: Client, message: Message):
+    """Download -> Rename -> Generate PDF thumb -> Upload (single file)."""
+    user_id = message.from_user.id
+    document = message.document
 
-        download_path = None
-        thumb_path = None
+    file_unique_id = document.file_unique_id if document else None
+    if not file_unique_id:
+        return await message.reply_text("Unsupported file type.")
 
-        try:
-            media_type = "document"
-            file_name = document.file_name or f"file_{file_unique_id}.pdf"
+    # Prevent accidental double-processing of same Telegram file
+    if file_unique_id in renaming_operations:
+        if (datetime.now() - renaming_operations[file_unique_id]).seconds < 10:
+            return
+    renaming_operations[file_unique_id] = datetime.now()
 
-            # Extract season/episode/quality from original filename
-            season, episode = extract_season_episode(file_name)
-            quality = extract_quality(file_name)
+    download_path = None
+    thumb_path = None
 
-            # Build new filename from template
-            format_template = await codeflixbots.get_format_template(user_id)
-            replacements = {
-                '{season}': season or 'XX',
-                '{episode}': episode or 'XX',
-                '{quality}': quality or 'HD',
-                'Season': season or 'XX',
-                'Episode': episode or 'XX',
-                'QUALITY': quality or 'HD'
-            }
-            for key, val in replacements.items():
-                format_template = format_template.replace(key, val)
+    try:
+        file_name = document.file_name or f"file_{file_unique_id}.pdf"
 
-            ext = os.path.splitext(file_name)[1]
-            if not ext:
-                ext = ".pdf"
-            new_filename = f"{format_template}{ext}"
+        # Extract season/episode/quality from original filename
+        season, episode = extract_season_episode(file_name)
+        quality = extract_quality(file_name)
 
-            # Paths
-            download_path = os.path.join("downloads", new_filename)
-            os.makedirs(os.path.dirname(download_path), exist_ok=True)
+        # For manga chapters, episode may be "31", "31.5", "36.6", etc.
+        # We keep as-is (no zfill) to preserve your style.
+        episode_val = episode or "XX"
+        season_val = season or "01"
+        quality_val = quality or "HD"
 
-            # Download PDF
-            status_msg = await message.reply_text("📥 **Downloading PDF...**")
-            file_path = await client.download_media(
-                message,
-                file_name=download_path,
-                progress=progress_for_pyrogram,
-                progress_args=("Downloading...", status_msg, time.time())
-            )
+        # Build new filename from template
+        format_template = await codeflixbots.get_format_template(user_id)
+        replacements = {
+            '{season}': season_val,
+            '{episode}': episode_val,
+            'Season': season_val,
+            'Episode': episode_val,
+            'QUALITY': quality_val,
+        }
+        for key, val in replacements.items():
+            format_template = format_template.replace(key, val)
 
-            # No FFmpeg metadata for PDF (previous error). We just use the downloaded file.
-            await status_msg.edit("🧾 **Preparing file...**")
+        ext = os.path.splitext(file_name)[1]
+        if not ext:
+            ext = ".pdf"
+        new_filename = f"{format_template}{ext}"
 
-            # Caption & thumbnail
-            caption = await codeflixbots.get_caption(user_id) or f"**{new_filename}**"
-            thumb_msg = await codeflixbots.get_thumbnail(user_id)
+        # Paths
+        download_path = os.path.join("downloads", new_filename)
+        os.makedirs(os.path.dirname(download_path), exist_ok=True)
 
-            if thumb_msg:
-                # User's custom thumbnail
-                raw_thumb_path = await client.download_media(thumb_msg)
+        # Download PDF
+        status_msg = await message.reply_text(f"📥 **Downloading PDF (Ch {episode_val})...**")
+        file_path = await client.download_media(
+            message,
+            file_name=download_path,
+            progress=progress_for_pyrogram,
+            progress_args=("Downloading...", status_msg, time.time())
+        )
+
+        await status_msg.edit("🧾 **Preparing file...**")
+
+        # Caption & thumbnail
+        caption = await codeflixbots.get_caption(user_id) or f"**{new_filename}**"
+        thumb_msg = await codeflixbots.get_thumbnail(user_id)
+
+        if thumb_msg:
+            # User's custom thumbnail
+            raw_thumb_path = await client.download_media(thumb_msg)
+            thumb_path = await process_pdf_thumbnail(raw_thumb_path)
+        else:
+            # Auto-generate PDF thumbnail
+            raw_thumb_path = await generate_pdf_thumbnail(file_path)
+            if raw_thumb_path:
                 thumb_path = await process_pdf_thumbnail(raw_thumb_path)
-            else:
-                # Auto-generate PDF thumbnail
-                raw_thumb_path = await generate_pdf_thumbnail(file_path)
-                if raw_thumb_path:
-                    thumb_path = await process_pdf_thumbnail(raw_thumb_path)
 
-            # Upload PDF back to user
-            await status_msg.edit("📤 **Uploading renamed PDF...**")
+        # Upload PDF back to user
+        await status_msg.edit(f"📤 **Uploading Ch {episode_val}...**")
 
-            await client.send_document(
-                chat_id=message.chat.id,
-                document=file_path,
-                caption=caption,
-                thumb=thumb_path,
-                progress=progress_for_pyrogram,
-                progress_args=("Uploading...", status_msg, time.time())
-            )
+        await client.send_document(
+            chat_id=message.chat.id,
+            document=file_path,
+            caption=caption,
+            thumb=thumb_path,
+            progress=progress_for_pyrogram,
+            progress_args=("Uploading...", status_msg, time.time())
+        )
 
-            await status_msg.delete()
+        await status_msg.delete()
 
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            logger.exception("Error while processing PDF:")
-            await message.reply_text(f"Error: `{str(e)}`")
-        finally:
-            await cleanup_files(download_path, thumb_path)
-            renaming_operations.pop(file_unique_id, None)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+    except Exception as e:
+        logger.exception("Error while processing PDF:")
+        await message.reply_text(f"Error: `{str(e)}`")
+    finally:
+        await cleanup_files(download_path, thumb_path)
+        renaming_operations.pop(file_unique_id, None)
