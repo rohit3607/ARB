@@ -3,15 +3,47 @@ from helper.database import codeflixbots
 from pyrogram.types import Message
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, InputUserDeactivated, UserIsBlocked, PeerIdInvalid
-import os, sys, time, asyncio, logging, datetime
+import os, sys, time, asyncio, logging, datetime, subprocess
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 ADMIN_USER_ID = Config.ADMIN
+ADMINS = Config.ADMIN
 
 # Flag to indicate if the bot is restarting
 is_restarting = False
+
+
+@Client.on_message(filters.command("update"))
+async def update_bot(client, message):
+    if message.from_user.id not in ADMINS:
+        return await message.reply_text("ғᴜᴄᴋ ʏᴏᴜ, ʏᴏᴜ ᴀʀᴇ ɴᴏᴛ ᴍʏ ᴍᴀsᴛᴇʀ. ɢᴏ ᴀᴡᴀʏ, ʙɪᴛᴄʜ 🙃.")
+
+    try:
+        msg = await message.reply_text("<b><blockquote>Pulling the latest updates and restarting the bot...</blockquote></b>")
+
+        # Run git pull
+        git_pull = subprocess.run(["git", "pull"], capture_output=True, text=True)
+
+        if git_pull.returncode == 0:
+            await msg.edit_text(f"<b><blockquote>Updates pulled successfully:\n\n{git_pull.stdout}</blockquote></b>")
+        else:
+            await msg.edit_text(f"<b><blockquote>Failed to pull updates:\n\n{git_pull.stderr}</blockquote></b>")
+            return
+
+        await asyncio.sleep(3)
+
+        await msg.edit_text("<b><blockquote>✅ Bᴏᴛ ɪs ʀᴇsᴛᴀʀᴛɪɴɢ ɴᴏᴡ...</blockquote></b>")
+
+    except Exception as e:
+        await message.reply_text(f"An error occurred: {e}")
+        return
+
+    finally:
+        # Restart the bot process
+        os.execl(sys.executable, sys.executable, *sys.argv)
+
 
 @Client.on_message(filters.private & filters.command("restart") & filters.user(ADMIN_USER_ID))
 async def restart_bot(b, m):
