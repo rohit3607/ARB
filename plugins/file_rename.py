@@ -27,6 +27,32 @@ renaming_operations = {}
 # Track media groups: key = (user_id, media_group_id)
 media_groups = {}
 
+
+async def wait_and_finalize(client, chat_id, user_id, media_group_id, media_type, caption):
+    """Wait until files stop arriving for the group, then call finalize."""
+    key = (user_id, media_group_id)
+    group = media_groups.get(key)
+    if not group:
+        return
+
+    try:
+        # loop until last_update is older than threshold
+        while True:
+            await asyncio.sleep(1)
+            if key not in media_groups:
+                return
+            group = media_groups.get(key)
+            if not group:
+                return
+            if (datetime.now() - group['last_update']).total_seconds() >= 2:
+                await finalize_media_group(client, chat_id, user_id, media_group_id, media_type, caption)
+                return
+    except Exception as e:
+        logger.error("wait_and_finalize error: %s", e)
+    finally:
+        if key in media_groups:
+            media_groups[key]['task'] = None
+
 # Enhanced regex patterns for season and episode extraction
 SEASON_EPISODE_PATTERNS = [
     # Standard patterns (S01E02, S01EP02)
@@ -90,12 +116,18 @@ async def cleanup_files(*paths):
             logger.error(f"Error removing {path}: {e}")
 
 
-async def finalize_media_group(client, chat_id, user_id, media_group_id, media_type, caption, thumb_path, status_msg=None):
+async def finalize_media_group(client, chat_id, user_id, media_group_id, media_type, caption, thumb_path=None, status_msg=None):
     """Sort stored files alphabetically and upload them sequentially."""
     key = (user_id, media_group_id)
     group = media_groups.get(key)
     if not group:
         return
+
+    # prefer group's stored status_msg and thumb_path if available
+    if not status_msg:
+        status_msg = group.get('status_msg')
+    if not thumb_path:
+        thumb_path = group.get('thumb_path')
 
     # wait briefly to ensure all parts arrived
     await asyncio.sleep(2)
@@ -140,7 +172,7 @@ async def finalize_media_group(client, chat_id, user_id, media_group_id, media_t
                 send_as = f.get('media_type')
 
             # if sending as video, ensure thumb and duration
-            local_thumb = thumb_path
+            local_thumb = thumb_path or group.get('thumb_path')
             duration = None
             if send_as == 'video':
                 if not local_thumb:
@@ -149,8 +181,8 @@ async def finalize_media_group(client, chat_id, user_id, media_group_id, media_t
                     except Exception as e:
                         logger.error("Thumbnail generation failed: %s", e)
 
-                if local_thumb:
-                    upload_params['thumb'] = local_thumb
+                    if local_thumb:
+                        upload_params['thumb'] = local_thumb
 
                 if duration:
                     upload_params['duration'] = duration
@@ -408,11 +440,18 @@ async def auto_rename_files(client, message):
         media_groups[key]['files'].append(entry)
         media_groups[key]['last_update'] = datetime.now()
 
-        # Schedule finalization (will wait briefly inside function to allow remaining parts to arrive)
-        asyncio.create_task(finalize_media_group(client, message.chat.id, user_id, media_group_id, media_type, caption, thumb_path, msg))
+        # Store the group's status message and thumb_path (use first msg as the group's single status message)
+        if not media_groups[key].get('status_msg'):
+            media_groups[key]['status_msg'] = msg
+        # store thumb path for group if not set
+        if thumb_path and not media_groups[key].get('thumb_path'):
+            media_groups[key]['thumb_path'] = thumb_path
 
-        # If this is a single file (not an album), finalize will run almost immediately
-        # Keep the status message until uploads finish; finalize will remove files
+        # Schedule a single waiter task per group to finalize once no new files arrive
+        if not media_groups[key].get('task'):
+            media_groups[key]['task'] = asyncio.create_task(wait_and_finalize(client, message.chat.id, user_id, media_group_id, media_type, caption))
+        # If this is a single file (not an album), the waiter will finalize shortly.
+        # Keep the per-file holding messages visible; a single group's status message will be edited during upload.
 
     except Exception as e:
         logger.error(f"Processing error: {e}")
