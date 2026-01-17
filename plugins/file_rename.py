@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 # Global dictionary to track ongoing operations
 renaming_operations = {}
+# Track media groups: key = (user_id, media_group_id)
+media_groups = {}
 
 # Enhanced regex patterns for season and episode extraction
 SEASON_EPISODE_PATTERNS = [
@@ -80,9 +82,66 @@ async def cleanup_files(*paths):
     for path in paths:
         try:
             if path and os.path.exists(path):
-                os.remove(path)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
         except Exception as e:
             logger.error(f"Error removing {path}: {e}")
+
+
+async def finalize_media_group(client, chat_id, user_id, media_group_id, media_type, caption, thumb_path, status_msg=None):
+    """Sort stored files alphabetically and upload them sequentially."""
+    key = (user_id, media_group_id)
+    group = media_groups.get(key)
+    if not group:
+        return
+
+    # wait briefly to ensure all parts arrived
+    await asyncio.sleep(2)
+    # if new files arrived recently, defer finalization
+    if (datetime.now() - group['last_update']).total_seconds() < 2:
+        return
+
+    files = group['files']
+    if not files:
+        media_groups.pop(key, None)
+        return
+
+    # Sort by renamed filename alphabetically
+    files.sort(key=lambda x: x['new_filename'].lower())
+
+    # Upload files sequentially
+    for idx, f in enumerate(files):
+        try:
+            upload_params = {
+                'chat_id': chat_id,
+                'thumb': thumb_path,
+                'progress': progress_for_pyrogram,
+                'progress_args': (f"Uploading {f['new_filename']}", status_msg, time.time())
+            }
+
+            if media_type == 'video':
+                await client.send_video(video=f['path'], caption=(caption if idx == 0 else None), **upload_params)
+            elif media_type == 'audio':
+                await client.send_audio(audio=f['path'], caption=(caption if idx == 0 else None), **upload_params)
+            else:
+                await client.send_document(document=f['path'], caption=(caption if idx == 0 else None), **upload_params)
+        except Exception as e:
+            logger.error(f"Upload failed for {f['path']}: {e}")
+
+    # Cleanup
+    for f in files:
+        try:
+            if os.path.exists(f['path']):
+                os.remove(f['path'])
+        except Exception:
+            pass
+
+    # remove the hold directory if exists
+    hold_dir = os.path.join('hold', str(user_id), str(media_group_id))
+    await cleanup_files(hold_dir)
+    media_groups.pop(key, None)
 
 async def process_thumbnail(thumb_path):
     """Process and resize thumbnail image"""
@@ -236,28 +295,39 @@ async def auto_rename_files(client, message):
         
         thumb_path = await process_thumbnail(thumb_path)
 
-        # Upload file
-        await msg.edit("**Uploading...**")
+        # Instead of uploading immediately, store renamed files in a hold directory
+        await msg.edit("**Holding file and preparing sequence...**")
+
+        # Use media_group_id when present; otherwise use message id to treat single file as its own group
+        media_group_id = str(message.media_group_id or message.message_id)
+        hold_dir = os.path.join('hold', str(user_id), str(media_group_id))
+        os.makedirs(hold_dir, exist_ok=True)
+
+        held_path = os.path.join(hold_dir, new_filename)
         try:
-            upload_params = {
-                'chat_id': message.chat.id,
-                'caption': caption,
-                'thumb': thumb_path,
-                'progress': progress_for_pyrogram,
-                'progress_args': ("Uploading...", msg, time.time())
-            }
+            shutil.move(file_path, held_path)
+        except Exception:
+            # fallback to copy
+            shutil.copy2(file_path, held_path)
 
-            if media_type == "document":
-                await client.send_document(document=file_path, **upload_params)
-            elif media_type == "video":
-                await client.send_video(video=file_path, **upload_params)
-            elif media_type == "audio":
-                await client.send_audio(audio=file_path, **upload_params)
+        key = (user_id, media_group_id)
+        entry = {
+            'path': held_path,
+            'new_filename': new_filename,
+            'media_type': media_type
+        }
 
-            await msg.delete()
-        except Exception as e:
-            await msg.edit(f"Upload failed: {e}")
-            raise
+        if key not in media_groups:
+            media_groups[key] = {'files': [], 'last_update': datetime.now()}
+
+        media_groups[key]['files'].append(entry)
+        media_groups[key]['last_update'] = datetime.now()
+
+        # Schedule finalization (will wait briefly inside function to allow remaining parts to arrive)
+        asyncio.create_task(finalize_media_group(client, message.chat.id, user_id, media_group_id, media_type, caption, thumb_path, msg))
+
+        # If this is a single file (not an album), finalize will run almost immediately
+        # Keep the status message until uploads finish; finalize will remove files
 
     except Exception as e:
         logger.error(f"Processing error: {e}")
