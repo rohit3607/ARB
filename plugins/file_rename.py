@@ -108,27 +108,64 @@ async def finalize_media_group(client, chat_id, user_id, media_group_id, media_t
         media_groups.pop(key, None)
         return
 
-    # Sort by renamed filename alphabetically
+    # Deduplicate by path and filename, then sort by renamed filename alphabetically
+    unique = {}
+    for item in files:
+        unique[item['path']] = item
+    files = list(unique.values())
+    files.sort(key=lambda x: x['new_filename'].lower())
+
+    # mark as uploading to prevent concurrent runs
+    group['uploading'] = True
     files.sort(key=lambda x: x['new_filename'].lower())
 
     # Upload files sequentially
+    # Determine user preference for upload type
+    try:
+        pref = await codeflixbots.get_media_preference(user_id)
+    except Exception:
+        pref = None
+
     for idx, f in enumerate(files):
         try:
             upload_params = {
                 'chat_id': chat_id,
-                'thumb': thumb_path,
                 'progress': progress_for_pyrogram,
                 'progress_args': (f"Uploading {f['new_filename']}", status_msg, time.time())
             }
 
-            if media_type == 'video':
-                await client.send_video(video=f['path'], caption=(caption if idx == 0 else None), **upload_params)
-            elif media_type == 'audio':
-                await client.send_audio(audio=f['path'], caption=(caption if idx == 0 else None), **upload_params)
+            # decide upload type based on user preference, falling back to detected media_type
+            send_as = pref or f.get('media_type')
+            if send_as not in ('video', 'audio', 'document'):
+                send_as = f.get('media_type')
+
+            # if sending as video, ensure thumb and duration
+            local_thumb = thumb_path
+            duration = None
+            if send_as == 'video':
+                if not local_thumb:
+                    try:
+                        local_thumb, duration = await generate_thumb_and_duration(f['path'])
+                    except Exception as e:
+                        logger.error("Thumbnail generation failed: %s", e)
+
+                if local_thumb:
+                    upload_params['thumb'] = local_thumb
+
+                if duration:
+                    upload_params['duration'] = duration
+
+            # caption only for first file
+            cap = caption if idx == 0 else None
+
+            if send_as == 'video':
+                await client.send_video(video=f['path'], caption=cap, **upload_params)
+            elif send_as == 'audio':
+                await client.send_audio(audio=f['path'], caption=cap, **upload_params)
             else:
-                await client.send_document(document=f['path'], caption=(caption if idx == 0 else None), **upload_params)
+                await client.send_document(document=f['path'], caption=cap, **upload_params)
         except Exception as e:
-            logger.error(f"Upload failed for {f['path']}: {e}")
+            logger.error("Upload failed for %s: %s", f.get('path'), e)
 
     # Cleanup
     for f in files:
@@ -138,9 +175,14 @@ async def finalize_media_group(client, chat_id, user_id, media_group_id, media_t
         except Exception:
             pass
 
-    # remove the hold directory if exists
+    # remove the hold directory if exists and delete status message
     hold_dir = os.path.join('hold', str(user_id), str(media_group_id))
     await cleanup_files(hold_dir)
+    try:
+        if status_msg:
+            await status_msg.delete()
+    except Exception:
+        pass
     media_groups.pop(key, None)
 
 async def process_thumbnail(thumb_path):
@@ -197,6 +239,49 @@ async def add_metadata(input_path, output_path, user_id):
     
     if process.returncode != 0:
         raise RuntimeError(f"FFmpeg error: {stderr.decode()}")
+
+
+async def generate_thumb_and_duration(input_path):
+    """Generate a thumbnail image from a video using ffmpeg and extract duration via hachoir."""
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        return None, None
+
+    thumb_path = f"{input_path}.jpg"
+    # extract a frame at 3 seconds (safe fallback)
+    cmd = [ffmpeg, '-ss', '3', '-i', input_path, '-vframes', '1', '-q:v', '2', thumb_path, '-y']
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+    except Exception:
+        return None, None
+
+    # get duration via hachoir if available
+    duration = None
+    try:
+        parser = createParser(input_path)
+        metadata = extractMetadata(parser)
+        if metadata and metadata.has('duration'):
+            d = metadata.get('duration')
+            try:
+                duration = int(d.total_seconds())
+            except Exception:
+                try:
+                    duration = int(d.seconds)
+                except Exception:
+                    duration = None
+    except Exception:
+        duration = None
+
+    if not os.path.exists(thumb_path):
+        return None, duration
+
+    return thumb_path, duration
 
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_rename_files(client, message):
@@ -318,7 +403,7 @@ async def auto_rename_files(client, message):
         }
 
         if key not in media_groups:
-            media_groups[key] = {'files': [], 'last_update': datetime.now()}
+            media_groups[key] = {'files': [], 'last_update': datetime.now(), 'uploading': False}
 
         media_groups[key]['files'].append(entry)
         media_groups[key]['last_update'] = datetime.now()
